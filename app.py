@@ -183,6 +183,8 @@ def summarize_differences(differences, teacher_kps=None, student_kps=None, sport
     
     return avg_diffs, tips, region_scores, accuracy_score
 
+import ffmpeg
+
 def create_comparison_video(coach_path, player_path, output_normal_path, output_dynamic_path, threshold=0.1):
     logger.debug(f"Creating comparison videos: normal={output_normal_path}, dynamic={output_dynamic_path}")
     pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
@@ -196,18 +198,75 @@ def create_comparison_video(coach_path, player_path, output_normal_path, output_
         logger.error(f"Failed to open player video: {player_path}")
         raise Exception(f"Failed to open player video: {player_path}")
     
-    # Use fixed dimensions for output videos
-    output_width = 360 * 2  # Two videos side by side
-    output_height = 480
+    # Get raw video dimensions from OpenCV
+    width1 = int(cap1.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height1 = int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    width2 = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height2 = int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap1.get(cv2.CAP_PROP_FPS)
     
-    logger.debug(f"Video dimensions: width={output_width}, height={output_height}, fps={fps}")
-    
+    # Detect rotation metadata using ffmpeg
+    def get_rotation(video_path):
+        try:
+            probe = ffmpeg.probe(video_path)
+            rotation = None
+            for stream in probe['streams']:
+                if 'tags' in stream and 'rotate' in stream['tags']:
+                    rotation = int(stream['tags']['rotate'])
+                    break
+                if 'side_data_list' in stream:
+                    for side_data in stream['side_data_list']:
+                        if side_data['side_data_type'] == 'Rotation':
+                            rotation = side_data['rotation']
+                            break
+            logger.debug(f"Detected rotation for {video_path}: {rotation} degrees")
+            return rotation if rotation else 0
+        except Exception as e:
+            logger.warning(f"Failed to detect rotation for {video_path}: {str(e)}")
+            return 0
 
-    fourcc = cv2.VideoWriter_fourcc(*'H264')  # Use H264 codec
+    rotation1 = get_rotation(coach_path)
+    rotation2 = get_rotation(player_path)
+    
+    # Determine intended orientation after accounting for rotation
+    is_vertical1 = (height1 > width1 and rotation1 in [0, 180]) or (width1 > height1 and rotation1 in [90, 270])
+    is_vertical2 = (height2 > width2 and rotation2 in [0, 180]) or (width2 > height2 and rotation2 in [90, 270])
+    is_vertical = is_vertical1 and is_vertical2  # Both videos should be treated similarly
+    
+    logger.debug(f"Coach video: raw {width1}x{height1}, rotated vertical={is_vertical1}, rotation={rotation1}")
+    logger.debug(f"Player video: raw {width2}x{height2}, rotated vertical={is_vertical2}, rotation={rotation2}")
+    
+    # Use the larger dimensions to maintain aspect ratio
+    input_width = max(width1, width2)
+    input_height = max(height1, height2)
+    
+    # Adjust for rotation if needed (rotate frames during processing)
+    def rotate_frame(frame, rotation):
+        if rotation == 90:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation == 180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        elif rotation == 270:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return frame
+
+    # Calculate output dimensions based on intended orientation
+    if is_vertical:
+        # Stack vertically: width remains the same, height is doubled
+        output_width = input_width
+        output_height = input_height * 2
+    else:
+        # Stack horizontally: height remains the same, width is doubled
+        output_width = input_width * 2
+        output_height = input_height
+    
+    logger.debug(f"Output dimensions: width={output_width}, height={output_height}, vertical={is_vertical}")
+    
+    # Initialize video writers with H264 codec
+    fourcc = cv2.VideoWriter_fourcc(*'H264')
     out_normal = cv2.VideoWriter(output_normal_path, fourcc, fps, (output_width, output_height))
     out_dynamic = cv2.VideoWriter(output_dynamic_path, fourcc, fps, (output_width, output_height))
-
+    
     if not out_normal.isOpened() or not out_dynamic.isOpened():
         logger.error(f"Failed to create video writer: normal={output_normal_path}, dynamic={output_dynamic_path}")
         raise Exception("Failed to create video writer")
@@ -225,9 +284,17 @@ def create_comparison_video(coach_path, player_path, output_normal_path, output_
             logger.debug(f"End of video reached at frame {frame_count}")
             break
         
-        # Resize frames to consistent dimensions
-        frame1 = cv2.resize(frame1, (360, 480))
-        frame2 = cv2.resize(frame2, (360, 480))
+        # Rotate frames based on metadata
+        frame1 = rotate_frame(frame1, rotation1)
+        frame2 = rotate_frame(frame2, rotation2)
+        
+        # Get dimensions after rotation
+        h1, w1 = frame1.shape[:2]
+        h2, w2 = frame2.shape[:2]
+        
+        # Resize frames to match the larger dimensions while preserving aspect ratio
+        frame1 = cv2.resize(frame1, (input_width, input_height), interpolation=cv2.INTER_AREA)
+        frame2 = cv2.resize(frame2, (input_width, input_height), interpolation=cv2.INTER_AREA)
         
         img1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2RGB)
         img2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB)
@@ -251,7 +318,7 @@ def create_comparison_video(coach_path, player_path, output_normal_path, output_
         if res1.pose_landmarks and res2.pose_landmarks:
             teacher_style = mp_drawing.DrawingSpec(color=(255, 255, 0), thickness=1, circle_radius=2)
             mp_drawing.draw_landmarks(frame_normal, res1.pose_landmarks, mp_pose.POSE_CONNECTIONS,
-                                    landmark_drawing_spec=teacher_style)
+                                      landmark_drawing_spec=teacher_style)
             
             valid_diffs = [(i, d) for i, d in enumerate(diffs) if d is not None]
             valid_diffs.sort(key=lambda x: x[1], reverse=True)
@@ -288,13 +355,18 @@ def create_comparison_video(coach_path, player_path, output_normal_path, output_
             
             mp_drawing.draw_landmarks(frame_normal, res2.pose_landmarks, mp_pose.POSE_CONNECTIONS)
         
-        combined_normal = cv2.hconcat([frame1, frame_normal])
+        # Combine frames based on intended orientation
+        if is_vertical:
+            combined_normal = cv2.vconcat([frame1, frame_normal])
+        else:
+            combined_normal = cv2.hconcat([frame1, frame_normal])
+        
         if res1.pose_landmarks and res2.pose_landmarks:
             valid_diffs = [d for d in diffs if d is not None]
             avg_diff = np.mean(valid_diffs) if valid_diffs else 0
             if avg_diff > 1.5 * threshold:
                 cv2.putText(combined_normal, "High Error Detected", (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 for _ in range(3):
                     out_normal.write(combined_normal)
             else:
@@ -317,12 +389,16 @@ def create_comparison_video(coach_path, player_path, output_normal_path, output_
             
             mid_idx = min(len(window_frames) // 2, len(window_frames) - 1)
             frame1, frame2, res1, res2 = window_frames[mid_idx]
+            frame1 = rotate_frame(frame1, rotation1)
+            frame2 = rotate_frame(frame2, rotation2)
+            frame1 = cv2.resize(frame1, (input_width, input_height), interpolation=cv2.INTER_AREA)
+            frame2 = cv2.resize(frame2, (input_width, input_height), interpolation=cv2.INTER_AREA)
             frame_dynamic = frame2.copy()
             
             if res1.pose_landmarks:
                 teacher_style = mp_drawing.DrawingSpec(color=(255, 255, 0), thickness=1, circle_radius=2)
                 mp_drawing.draw_landmarks(frame_dynamic, res1.pose_landmarks, mp_pose.POSE_CONNECTIONS,
-                                        landmark_drawing_spec=teacher_style)
+                                          landmark_drawing_spec=teacher_style)
             
             if res2.pose_landmarks:
                 overlay = frame_dynamic.copy()
@@ -337,7 +413,11 @@ def create_comparison_video(coach_path, player_path, output_normal_path, output_
                 frame_dynamic = cv2.addWeighted(overlay, alpha, frame_dynamic, 1 - alpha, 0)
                 mp_drawing.draw_landmarks(frame_dynamic, res2.pose_landmarks, mp_pose.POSE_CONNECTIONS)
             
-            combined_base = cv2.hconcat([frame1, frame_dynamic])
+            # Combine frames based on intended orientation
+            if is_vertical:
+                combined_base = cv2.vconcat([frame1, frame_dynamic])
+            else:
+                combined_base = cv2.hconcat([frame1, frame_dynamic])
             
             num_repeats = 20 if avg_diff <= 1.5 * threshold else 30
             for t in range(num_repeats):
@@ -352,6 +432,7 @@ def create_comparison_video(coach_path, player_path, output_normal_path, output_
                         h, w = frame_dynamic.shape[:2]
                         p2 = res2.pose_landmarks.landmark[i]
                         x, y = int(p2.x * w), int(p2.y * h)
+                        x_offset = 0 if is_vertical else input_width
                         if d > threshold * 1.5:
                             color = (0, 0, 255)
                             label = f"{JOINT_NAMES[i]}: High"
@@ -361,14 +442,14 @@ def create_comparison_video(coach_path, player_path, output_normal_path, output_
                         else:
                             color = (0, 255, 0)
                             label = None
-                        cv2.circle(combined_dynamic, (x + 360, y), circle_radius, color, -1)
+                        cv2.circle(combined_dynamic, (x + x_offset, y), circle_radius, color, -1)
                         if label:
-                            cv2.putText(combined_dynamic, label, (x + 370, y), cv2.FONT_HERSHEY_SIMPLEX, 
-                                       0.6, color, 1)
+                            cv2.putText(combined_dynamic, label, (x + x_offset + 10, y), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
                 
                 if avg_diff > 1.5 * threshold:
                     cv2.putText(combined_dynamic, "High Error Detected", (10, 30), 
-                               cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 0, 255), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 0, 255), 2)
                 
                 if top_errors:
                     summary = "Focus on: " + ", ".join(JOINT_NAMES[i] for i, _ in top_errors[:3])
@@ -379,7 +460,7 @@ def create_comparison_video(coach_path, player_path, output_normal_path, output_
                         opacity = 1 - (t - num_repeats // 2) / (num_repeats // 2)
                     overlay = combined_dynamic.copy()
                     cv2.putText(overlay, summary, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 
-                               0.7, (255, 255, 255), 2)
+                                0.7, (255, 255, 255), 2)
                     cv2.addWeighted(overlay, opacity, combined_dynamic, 1 - opacity, 0, combined_dynamic)
                 
                 out_dynamic.write(combined_dynamic)
@@ -401,7 +482,6 @@ def create_comparison_video(coach_path, player_path, output_normal_path, output_
     logger.info(f"Dynamic video size: {os.path.getsize(output_dynamic_path)} bytes")
     logger.info(f"Created comparison videos: normal={output_normal_path}, dynamic={output_dynamic_path}")
     return output_normal_path, output_dynamic_path
-
 def export_differences_to_csv(differences, output_csv):
     try:
         with open(output_csv, "w", newline="") as f:
